@@ -3,10 +3,56 @@ import { expect, it } from "vitest";
 import pino from "pino";
 
 import { createShutdown } from "../main/shutdown.js";
-import { registerProcessShutdown } from "../main/processShutdown.js";
-import type { RuntimeDependencies } from "../main/types.js";
-import type { StdioServerHandle } from "@modelcontextprotocol/server/stdio";
+import {
+  createExitStatus,
+  latchSignalShutdown,
+  registerProcessShutdown,
+  registerSignalShutdown,
+} from "../main/processShutdown.js";
+import type { McpServerHandle, RuntimeDependencies } from "../main/types.js";
 import { createManagedBinarySession } from "../composition/binary.js";
+
+it("registers only signals for a listener and reports the signal exit status", () => {
+  const signals = new EventEmitter();
+  const statuses: number[] = [];
+  const unregister = registerSignalShutdown(
+    (status) => statuses.push(status),
+    signals,
+  );
+  signals.emit("SIGTERM");
+  signals.emit("SIGINT");
+  expect(statuses).toEqual([143, 130]);
+  unregister();
+  signals.emit("SIGTERM");
+  expect(statuses).toEqual([143, 130]);
+  expect(signals.listenerCount("SIGTERM")).toBe(0);
+});
+
+it("names the signal that fired, passes none for stdin, and ignores stdin when the events omit it", () => {
+  const signals = new EventEmitter();
+  const input = new EventEmitter();
+  const triggers: (string | undefined)[] = [];
+  const withInput = registerProcessShutdown((signal) => triggers.push(signal), {
+    signals,
+    stdin: input,
+  });
+  signals.emit("SIGINT");
+  input.emit("end");
+  expect(triggers).toEqual(["SIGINT", undefined]);
+  withInput();
+  const signalsOnly = registerProcessShutdown(
+    (signal) => triggers.push(signal),
+    { signals },
+  );
+  signals.emit("SIGTERM");
+  input.emit("end");
+  input.emit("close");
+  expect(triggers).toEqual(["SIGINT", undefined, "SIGTERM"]);
+  signalsOnly();
+  signals.emit("SIGINT");
+  expect(triggers).toEqual(["SIGINT", undefined, "SIGTERM"]);
+  expect(input.listenerCount("end")).toBe(0);
+});
 
 const shutdownEvents = ["SIGINT", "SIGTERM", "end", "close"] as const;
 
@@ -51,7 +97,7 @@ it.each(shutdownEvents)(
         };
       },
     };
-    const handle: StdioServerHandle = {
+    const handle: McpServerHandle = {
       close: async () => {
         transportCloseCalls += 1;
         if (transportCloseCalls === 1)
@@ -134,7 +180,7 @@ it("joins concurrent shutdown events and retries only failed owners", async () =
     registerShutdown: (handler) =>
       registerProcessShutdown(handler, { signals, stdin: input }),
   };
-  const handle: StdioServerHandle = {
+  const handle: McpServerHandle = {
     close: async () => {
       transportCloseCalls += 1;
       if (transportCloseCalls === 1)
@@ -175,4 +221,34 @@ it("joins concurrent shutdown events and retries only failed owners", async () =
   expect(signals.listenerCount("SIGTERM")).toBe(0);
   expect(input.listenerCount("end")).toBe(0);
   expect(input.listenerCount("close")).toBe(0);
+});
+
+it("latches the first startup signal, exits at once on a second, and hands the status over on release", () => {
+  const signals = new EventEmitter();
+  const exits: number[] = [];
+  const latch = latchSignalShutdown(signals, (status) => exits.push(status));
+  expect(signals.listenerCount("SIGINT")).toBe(1);
+  signals.emit("SIGTERM");
+  expect(exits).toEqual([]);
+  signals.emit("SIGINT");
+  expect(exits).toEqual([143]);
+  expect(latch.release()).toBe(143);
+  expect(signals.listenerCount("SIGINT")).toBe(0);
+  expect(signals.listenerCount("SIGTERM")).toBe(0);
+  const quiet = latchSignalShutdown(signals, (status) => exits.push(status));
+  expect(quiet.release()).toBeUndefined();
+});
+
+it("keeps a signal's exit status through the entry's normal return and yields to a real failure", () => {
+  const codes: number[] = [];
+  const exit = createExitStatus((code) => codes.push(code));
+  exit.set(0);
+  exit.signal(143);
+  exit.set(0);
+  expect(codes).toEqual([0, 143, 143]);
+  exit.set(1);
+  expect(codes.at(-1)).toBe(1);
+  const plain = createExitStatus((code) => codes.push(code));
+  plain.set(0);
+  expect(codes.at(-1)).toBe(0);
 });
