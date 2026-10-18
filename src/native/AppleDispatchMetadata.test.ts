@@ -501,6 +501,102 @@ describe("malformed Objective-C property records", () => {
   );
 });
 
+describe("Objective-C method selector recovery", () => {
+  it.each([
+    [false, false, "instance"],
+    [true, false, "class"],
+    [false, true, "instance"],
+    [true, true, "class"],
+  ] as const)(
+    "retains method siblings around an empty selector (relative=%s, category=%s, type=%s)",
+    (relative, category, methodType) => {
+      const bytes = fixture(false, "partial-method");
+      const pointer = (field: number, target: number) =>
+        bytes.writeBigUInt64LE(base + BigInt(target), field);
+      // Keep the unrelated class and category coverage complete.
+      bytes.writeUInt32LE(2, 0x300);
+      bytes.writeUInt32LE(3, 0x380);
+      pointer(0xb98, 0x700);
+      const baseline = decodeAppleDispatchMetadata(bytes, 100, provenance);
+      pointer(
+        category
+          ? methodType === "instance"
+            ? 0xb50
+            : 0xb58
+          : methodType === "instance"
+            ? 0x320
+            : 0x3a0,
+        0xd00,
+      );
+      bytes.writeUInt32LE(relative ? 0xc000000c : 24, 0xd00);
+      bytes.writeUInt32LE(3, 0xd04);
+      bytes.write("earlier:\0", 0xe00);
+      bytes.write("later:\0", 0xe40);
+      for (const [index, selector] of [0xe00, 0xe20, 0xe40].entries()) {
+        const entry = 0xd08 + index * (relative ? 12 : 24);
+        if (relative) {
+          bytes.writeInt32LE(selector - entry, entry);
+          bytes.writeInt32LE(0x5c0 - entry - 4, entry + 4);
+          bytes.writeInt32LE(0x700 - entry - 8, entry + 8);
+        } else {
+          pointer(entry, selector);
+          pointer(entry + 8, 0x5c0);
+          pointer(entry + 16, 0x700);
+        }
+      }
+      const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+      expect(result.objc_classes).toHaveLength(2);
+      expect(result.objc_categories).toHaveLength(1);
+      expect(result.objc_ivars).toEqual(baseline.objc_ivars);
+      expect(result.objc_protocols).toEqual(baseline.objc_protocols);
+      expect(result.objc_classes[0]?.properties).toEqual(
+        baseline.objc_classes[0]?.properties,
+      );
+      expect(
+        result.objc_dispatch_implementations
+          .filter(
+            (method) =>
+              method.method_type === methodType &&
+              (method.category !== undefined) === category,
+          )
+          .map(({ selector }) => selector),
+      ).toEqual(["earlier:", "later:"]);
+      if (category) {
+        expect(
+          result.objc_categories[0]?.[
+            methodType === "instance" ? "instance_methods" : "class_methods"
+          ],
+        ).toEqual(["earlier:", "later:"]);
+      } else {
+        expect(
+          result.objc_classes
+            .find(
+              ({ is_meta_class }) => is_meta_class === (methodType === "class"),
+            )
+            ?.methods.map(({ selector }) => selector),
+        ).toEqual(["earlier:", "later:"]);
+      }
+      const affected = category
+        ? "objc_properties_categories"
+        : "objc_class_method_ivar_metadata";
+      expect(
+        result.coverage.find(({ facet }) => facet === affected),
+      ).toMatchObject({
+        status: "partial",
+        reason: expect.stringContaining(
+          `Objective-C Fixture${category ? " category FixtureCategory" : ""} ${methodType} method 1 at 0x${(base + BigInt(0xd08 + (relative ? 12 : 24))).toString(16)} has an empty selector`,
+        ),
+      });
+      const independent = category
+        ? "objc_class_method_ivar_metadata"
+        : "objc_properties_categories";
+      expect(
+        result.coverage.find(({ facet }) => facet === independent),
+      ).toEqual(baseline.coverage.find(({ facet }) => facet === independent));
+    },
+  );
+});
+
 describe("Objective-C malformed identity recovery", () => {
   it.each(["class selector", "category name"] as const)(
     "isolates an empty %s before result validation",
@@ -508,11 +604,15 @@ describe("Objective-C malformed identity recovery", () => {
       const bytes = fixture(false, "unmapped-class");
       bytes[malformed === "class selector" ? 0x460 : 0xbc0] = 0;
       const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
-      expect(result.objc_categories).toEqual([]);
       if (malformed === "category name") {
+        expect(result.objc_categories).toEqual([]);
         expect(result.objc_classes).toHaveLength(2);
         expect(result.objc_protocols).toMatchObject([
           { name: "FixtureProtocol" },
+        ]);
+      } else {
+        expect(result.objc_categories).toMatchObject([
+          { name: "FixtureCategory", instance_methods: [] },
         ]);
       }
       expect(

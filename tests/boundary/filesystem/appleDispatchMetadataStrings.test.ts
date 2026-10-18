@@ -11,12 +11,13 @@ import { machoWithPropertyAttributes } from "../../fixtures/objcPropertyMacho.js
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 it.each([
-  ["plain names", "Fixture", "first", "perform:"],
-  ["leading U+FEFF", "\ufeffFixture", "\ufefffirst", "\ufeffperform:"],
-  ["U+FEFF-only names", "\ufeff", "\ufeff", "\ufeff"],
+  ["plain names", "Fixture", "first", "perform:", false],
+  ["leading U+FEFF", "\ufeffFixture", "\ufefffirst", "\ufeffperform:", false],
+  ["U+FEFF-only names", "\ufeff", "\ufeff", "\ufeff", false],
+  ["an empty preceding selector", "Fixture", "first", "perform:", true],
 ] as const)(
   "preserves %s in file-backed Apple metadata identities",
-  async (_, className, propertyName, selector) => {
+  async (_, className, propertyName, selector, emptyFirst) => {
     const directory = await createTestTempDirectory("rea-dispatch-strings-");
     const path = join(directory, "fixture.bin");
     const bytes = machoWithPropertyAttributes("Tq,N", {
@@ -32,6 +33,12 @@ it.each([
     bytes.writeBigUInt64LE(base + 0x800n, 0x718);
     bytes.write(`${selector}\0`, 0x750);
     bytes.write("v@:\0", 0x780);
+    const methodEntry = emptyFirst ? 0x720 : 0x708;
+    if (emptyFirst) {
+      bytes.copy(bytes, methodEntry, 0x708, 0x720);
+      bytes.writeUInt32LE(2, 0x704);
+      bytes.writeBigUInt64LE(base + 0x740n, 0x708);
+    }
     await writeFile(path, bytes);
     const target = await parseBinaryTarget(path);
     if (!target.ok) throw target.error;
@@ -63,7 +70,10 @@ it.each([
         class_name: className,
         selector,
         implementation_address: "0x100000800",
-        location: { address: "0x100000708", file_offset: 0x708 },
+        location: {
+          address: `0x${(base + BigInt(methodEntry)).toString(16)}`,
+          file_offset: methodEntry,
+        },
       },
     ]);
     expect(
@@ -71,6 +81,15 @@ it.each([
         ({ facet }) => facet === "objc_properties_categories",
       ),
     ).toMatchObject({ status: "complete", reason: null });
+    if (emptyFirst)
+      expect(
+        metadata.result.coverage.find(
+          ({ facet }) => facet === "objc_class_method_ivar_metadata",
+        ),
+      ).toMatchObject({
+        status: "partial",
+        reason: expect.stringContaining("empty selector"),
+      });
     expect(await readFile(path)).toEqual(bytes);
   },
 );

@@ -3,7 +3,7 @@ import type { ObjcSwiftMetadata } from "../domain/native/objcSwiftMetadata.js";
 import type { Segment, Section } from "./AppleMachoSelection.js";
 import { boundClassName, decodeObjcCategories } from "./AppleObjcCategories.js";
 import { readObjcPropertiesOf } from "./AppleObjcProperties.js";
-import type { DecodeIssue } from "./AppleDispatchDecodeFacts.js";
+import { issue, type DecodeIssue } from "./AppleDispatchDecodeFacts.js";
 import { createObjcProtocolReader } from "./AppleObjcProtocols.js";
 import type {
   BinaryMetadataEvidence,
@@ -171,8 +171,20 @@ export const decodeObjcDispatchFacets = (input: {
         void cause;
       }
       const selector = read.string(selectorAddress);
-      if (selector.length === 0)
-        throw new TypeError("Objective-C method has an empty selector");
+      if (selector.length === 0) {
+        const message = `Objective-C ${category === undefined ? className : `${className} category ${category}`} ${methodType} method ${String(index)} at ${hex(entry)} has an empty selector`;
+        if (category === undefined) failures.push(message);
+        else
+          categoryIssues.push(
+            issue(
+              "objc_properties_categories",
+              "category_method_selector_empty",
+              message,
+              hex(entry),
+            ),
+          );
+        continue;
+      }
       selectors.push(selector);
       result.objc_dispatch_implementations.push({
         class_name: className,
