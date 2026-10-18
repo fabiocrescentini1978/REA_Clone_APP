@@ -1,5 +1,43 @@
 # Changelog
 
+## [6.8.0](https://github.com/morluto/rea/compare/rea-agents-6.7.0...rea-agents-6.8.0) (2026-10-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **apktool:** Numeric legacy locale selectors such as es-r419 are rejected. Use es-419 or b+es+419. Two-letter region selectors remain supported.
+* **plist:** Unresolved XML scalar values now use $plist_type unknown wrappers with element, literal and reason. This replaces the former real/null unknown marker and malformed scalar prefix fallback. Supported extended UTC years now preserve their timestamp.
+
+### Bug Fixes
+
+* **adb:** preserve command failure target identities ([8307ea3](https://github.com/morluto/rea/commit/8307ea3717b9bbc6b5cf83d96a0f73d47708e586)), closes [#4641](https://github.com/morluto/rea/issues/4641) [#4643](https://github.com/morluto/rea/issues/4643) [#5051](https://github.com/morluto/rea/issues/5051)
+* **apktool:** select numeric regions using Android b+ qualifiers ([29910d1](https://github.com/morluto/rea/commit/29910d16b98fe4b607a7aa15928789a73614b0b9))
+* **errors:** retain secondary failures without replacing primary causes ([d4e2339](https://github.com/morluto/rea/commit/d4e233946a39574e36a0d927b13eb77528ad5dc5)), closes [#5059](https://github.com/morluto/rea/issues/5059)
+* **hopper:** verify and repair the Linux embedding runtime ([#5041](https://github.com/morluto/rea/issues/5041)) ([b0b485a](https://github.com/morluto/rea/commit/b0b485abff802b79d238dd24a9fa4abd0713d3ee))
+* **native:** bound LLDB PID reads before validation ([292e7be](https://github.com/morluto/rea/commit/292e7bef27c983853841894f56984a6566319972)), closes [#5057](https://github.com/morluto/rea/issues/5057)
+* **native:** retain LLDB evidence prefixes after read failures ([eb2c3b5](https://github.com/morluto/rea/commit/eb2c3b589eeb2884761b30d5b0402aa2d9337b49)), closes [#5058](https://github.com/morluto/rea/issues/5058)
+* **native:** retain signature roots until descriptor cleanup completes ([9e259f8](https://github.com/morluto/rea/commit/9e259f87c8be3d22a0b96f12ed7838830869c987)), closes [#5052](https://github.com/morluto/rea/issues/5052)
+* **native:** retain UI interruption source through final cleanup ([36d156f](https://github.com/morluto/rea/commit/36d156ff05f48f9f0b4c4abb8f7c899249a49ebf)), closes [#5056](https://github.com/morluto/rea/issues/5056)
+* **native:** validate LLDB readback encoding before reporting facts ([7201e8a](https://github.com/morluto/rea/commit/7201e8a4439b3ece4a5470014525ea2e13e4c183)), closes [#5055](https://github.com/morluto/rea/issues/5055)
+* **plist:** ignore processing instructions between container members ([fd728f2](https://github.com/morluto/rea/commit/fd728f271e7de7bcfa63890b573715720d5f948c)), closes [#4964](https://github.com/morluto/rea/issues/4964)
+* **plist:** preserve source semantics in XML data decoding ([cee95b2](https://github.com/morluto/rea/commit/cee95b2ae6a19122de95103b2d23bc6f8c9c4428)), closes [#4978](https://github.com/morluto/rea/issues/4978)
+* **plist:** preserve unknown XML scalar identities ([3537e58](https://github.com/morluto/rea/commit/3537e58c1ab29309f06eabf50bc52adba9817a0c)), closes [#4852](https://github.com/morluto/rea/issues/4852)
+* **session:** admit direct native dispatch metadata providers ([50b6975](https://github.com/morluto/rea/commit/50b6975d861069e2c6cfa202780621449f863802)), closes [#5070](https://github.com/morluto/rea/issues/5070)
+* **session:** align call relationship discovery with traversal modes ([1d5bf5f](https://github.com/morluto/rea/commit/1d5bf5ff084b49c1c630a312520c59d6b08c6ade)), closes [#4687](https://github.com/morluto/rea/issues/4687) [#5068](https://github.com/morluto/rea/issues/5068)
+* **session:** describe native UI trace source routes ([32f0e51](https://github.com/morluto/rea/commit/32f0e5120966be59d17a1e092353816c76a9c5e2)), closes [#5071](https://github.com/morluto/rea/issues/5071)
+* **tests:** preserve temporary fixture ownership ([093ce69](https://github.com/morluto/rea/commit/093ce695f0a7c3407c7fde520ed8b20c0981b408))
+* **tests:** restore Android prerequisite verification ([23f984b](https://github.com/morluto/rea/commit/23f984b1a884baefc3c44e4ab697f6eff61dffb6))
+
+
+### Performance Improvements
+
+* **hopper:** reuse decoded records for literal string matches ([#5017](https://github.com/morluto/rea/issues/5017)) ([63c9708](https://github.com/morluto/rea/commit/63c970812b8b5c6664400c9360e22c427844820c))
+
+
+### Documentation
+
+* **jeb:** qualify Linux CE native workflows ([#5002](https://github.com/morluto/rea/issues/5002)) ([c12d9ed](https://github.com/morluto/rea/commit/c12d9eda87aa5a022ee7e18ea96d8d03bfd12e96)), closes [#4996](https://github.com/morluto/rea/issues/4996)
+
 ## [6.7.0](https://github.com/morluto/rea/compare/rea-agents-6.6.0...rea-agents-6.7.0) (2026-10-18)
 
 ### Highlights
