@@ -155,6 +155,10 @@ const NATIVE_UI_ACTION_COMPOSITION: ModeComposition = {
       ],
     },
   ],
+  trace_call_path: [
+    "procedure_address",
+    ["procedure_callees", "procedure_callers"],
+  ],
 };
 
 // Complete coverage is checked against canonical enhanced contracts, rather than

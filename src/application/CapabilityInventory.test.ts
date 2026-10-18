@@ -762,3 +762,93 @@ describe("trace_feature requirements", () => {
     ).toMatchObject({ available: false, reason: "provider_missing" });
   });
 });
+
+describe("trace_call_path requirements", () => {
+  const capabilities = (operations: readonly string[]) =>
+    operations.map((operation) => ({
+      operation,
+      available: true,
+      reason: null,
+    }));
+
+  it("is available when the provider declares procedure_address and either callees or callers", () => {
+    for (const relation of ["procedure_callees", "procedure_callers"]) {
+      expect(
+        entry(
+          "trace_call_path",
+          status({
+            open: true,
+            kind: "executable",
+            capabilities: capabilities(["procedure_address", relation]),
+          }),
+        ),
+      ).toMatchObject({ available: true, reason: "available" });
+    }
+  });
+
+  it("is unavailable when procedure_address is missing", () => {
+    expect(
+      entry(
+        "trace_call_path",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: capabilities([
+            "procedure_callees",
+            "procedure_callers",
+          ]),
+        }),
+      ),
+    ).toMatchObject({
+      available: false,
+      reason: "provider_missing",
+      remediation: expect.stringContaining("procedure_address"),
+    });
+  });
+
+  it("is unavailable when neither callees nor callers exist", () => {
+    expect(
+      entry(
+        "trace_call_path",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: capabilities(["procedure_address"]),
+        }),
+      ),
+    ).toMatchObject({
+      available: false,
+      reason: "provider_missing",
+      remediation: expect.stringContaining(
+        "procedure_callees, procedure_callers",
+      ),
+    });
+  });
+
+  it("is unavailable when required operations are marked unavailable", () => {
+    expect(
+      entry(
+        "trace_call_path",
+        status({
+          open: true,
+          kind: "executable",
+          capabilities: [
+            {
+              operation: "procedure_address",
+              available: false,
+              reason: "Procedure address lookup failed",
+            },
+            {
+              operation: "procedure_callees",
+              available: true,
+              reason: null,
+            },
+          ],
+        }),
+      ),
+    ).toMatchObject({
+      available: false,
+      reason: "provider_unavailable",
+    });
+  });
+});
