@@ -16,6 +16,7 @@ import {
   applyEdits,
   createScanner,
   format as formatJson,
+  getNodeValue,
   parse as parseJsonc,
   parseTree,
   printParseErrorCode,
@@ -1325,6 +1326,124 @@ const isJsonMember = (property: Node, key: string): boolean =>
 const effectiveJsonProperty = (object: Node, key: string): Node | undefined =>
   object.children?.findLast((property) => isJsonMember(property, key));
 
+/** The object a client reads at `path`, following the effective members. */
+const effectiveJsonObject = (
+  root: Node | undefined,
+  path: readonly string[],
+): Node | undefined => {
+  let node = root;
+  for (const key of path) {
+    if (node?.type !== "object") return undefined;
+    node = effectiveJsonProperty(node, key)?.children?.[1];
+  }
+  return node?.type === "object" ? node : undefined;
+};
+
+/**
+ * Earlier members of one server name repeated in the tables a client reads,
+ * in document order. Parsing keeps only the last member, as clients do.
+ */
+export interface ShadowedClientServers {
+  readonly servers: readonly unknown[];
+  /** Repeats among OpenCode V1 members beside a native V2 table. */
+  readonly legacyServers: readonly unknown[];
+}
+
+const NO_SHADOWED_SERVERS: ShadowedClientServers = Object.freeze({
+  servers: [],
+  legacyServers: [],
+});
+
+const escapeRegExp = (value: string): string =>
+  value.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+/** JSON's two-character escapes, by the unit each one decodes to. */
+const JSON_SHORT_ESCAPES: Readonly<Record<string, string>> = {
+  '"': String.raw`\"`,
+  "\\": String.raw`\\`,
+  "/": String.raw`\/`,
+  "\b": String.raw`\b`,
+  "\f": String.raw`\f`,
+  "\n": String.raw`\n`,
+  "\r": String.raw`\r`,
+  "\t": String.raw`\t`,
+};
+
+/**
+ * Matches every JSON string token that decodes to `name`, in any spelling a
+ * JSON reader accepts: each UTF-16 unit literally, as a `\uXXXX` escape in
+ * either hex case, or as its short escape. It can also match inside a longer
+ * string, so its count bounds the members from above and never misses one.
+ */
+const jsonStringTokenPattern = (name: string): RegExp => {
+  const units = Array.from({ length: name.length }, (_, index) => {
+    const unit = name.charAt(index);
+    const hex = name
+      .charCodeAt(index)
+      .toString(16)
+      .padStart(4, "0")
+      .replace(/[a-f]/gu, (digit) => `[${digit}${digit.toUpperCase()}]`);
+    const short = JSON_SHORT_ESCAPES[unit];
+    const spellings = [
+      escapeRegExp(unit),
+      String.raw`\\u${hex}`,
+      ...(short === undefined ? [] : [escapeRegExp(short)]),
+    ];
+    return `(?:${spellings.join("|")})`;
+  });
+  return new RegExp(`"${units.join("")}"`, "gu");
+};
+
+/** Values of the earlier members named `name` in `object`. */
+const shadowedJsonMembers = (
+  object: Node | undefined,
+  name: string,
+): readonly unknown[] =>
+  (object?.children ?? [])
+    .filter((property) => isJsonMember(property, name))
+    .slice(0, -1)
+    .map((property): unknown => {
+      const value = property.children?.[1];
+      return value === undefined ? undefined : getNodeValue(value);
+    });
+
+/**
+ * Earlier members of `name` that removing its effective entry would make
+ * effective, so a removal decision must cover them too. Locating them needs a
+ * syntax tree of the whole document, which is built only when the name's
+ * string token occurs more than once.
+ */
+export const shadowedClientServers = (
+  text: string,
+  parsed: ClientConfigurationDocument,
+  name: string,
+): ShadowedClientServers => {
+  // TOML rejects repeated keys, Hermes parses YAML with unique keys, and the
+  // Harness owner edits REA's entry by id rather than through a server table.
+  if (
+    parsed.dialect === "toml" ||
+    parsed.dialect === "grok" ||
+    parsed.dialect === "hermes" ||
+    parsed.dialect === "dsh" ||
+    (text.match(jsonStringTokenPattern(name))?.length ?? 0) < 2
+  )
+    return NO_SHADOWED_SERVERS;
+  const root = parseTree(text, [], { allowTrailingComma: true });
+  return {
+    servers: shadowedJsonMembers(
+      effectiveJsonObject(root, parsed.serversPath),
+      name,
+    ),
+    legacyServers:
+      parsed.dialect === "opencode_v2" && !OPENCODE_V2_MCP_SETTINGS.has(name)
+        ? shadowedJsonMembers(
+            effectiveJsonObject(root, parsed.serversPath.slice(0, 1)),
+            name,
+          )
+        : [],
+  };
+};
+
 /** Apply one edit and format the lines it touched, as `modify` does. */
 const applyFormattedJsonEdit = (text: string, edit: Edit): string => {
   const edited = applyEdits(text, [edit]);
@@ -1388,15 +1507,59 @@ export interface ClientConfigurationShadowedMember {
 }
 
 /**
+ * Delete every member named `key` from `object`, parsed from `text`, in one
+ * pass. Removing only the effective member would make the previous repeat
+ * effective. A separator stays only between members that remain, plus a JSONC
+ * trailing separator while any member remains; comments and whitespace
+ * outside the removed members and separators keep their bytes.
+ */
+const deleteRepeatedJsonMember = (
+  text: string,
+  object: Node,
+  key: string,
+): string => {
+  const siblings = object.children ?? [];
+  const removed = siblings.map((member) => isJsonMember(member, key));
+  const anyKept = removed.includes(false);
+  const spans: { readonly start: number; readonly end: number }[] = [];
+  // Walk back so `laterKept` says whether a kept member follows a separator.
+  let laterKept = false;
+  for (const [index, member] of [...siblings.entries()].reverse()) {
+    const end = member.offset + member.length;
+    const separator = nextJsoncToken(text, end);
+    const last = index === siblings.length - 1;
+    // Admitted documents always separate members, so this is a parser defect.
+    if (separator.kind !== JSON_COMMA && !last)
+      throw new TypeError("JSON property separator was not found");
+    const keepSeparator = last ? anyKept : removed[index] !== true && laterKept;
+    if (separator.kind === JSON_COMMA && !keepSeparator)
+      spans.push({ start: separator.offset, end: separator.offset + 1 });
+    if (removed[index] === true) spans.push({ start: member.offset, end });
+    else laterKept = true;
+  }
+  // Spans were collected back to front and never overlap.
+  const kept: string[] = [];
+  let cursor = 0;
+  for (const span of spans.reverse()) {
+    kept.push(text.slice(cursor, span.start));
+    cursor = span.end;
+  }
+  kept.push(text.slice(cursor));
+  return kept.join("");
+};
+
+/**
  * Set or delete the member a client reads at `path`, keeping every byte
  * outside that member. Shadowed duplicates stay in place, and deleting a
  * member that shadows one is refused so the earlier member never becomes
- * active, whatever its ownership.
+ * active, unless the caller has established that every repeated member is its
+ * own to remove.
  */
 const editJsonMember = (
   text: string,
   path: readonly string[],
   value: unknown,
+  removeShadowedMembers: boolean,
 ): Result<string, ClientConfigurationShadowedMember> => {
   let object = parseTree(text, [], { allowTrailingComma: true });
   for (const [index, key] of path.entries()) {
@@ -1442,11 +1605,23 @@ const editJsonMember = (
         (sibling) => sibling !== property && isJsonMember(sibling, key),
       )
     )
-      return err({ kind: "shadowed_member", path });
+      return removeShadowedMembers
+        ? ok(deleteRepeatedJsonMember(text, object, key))
+        : err({ kind: "shadowed_member", path });
     return ok(deleteJsonProperty(text, object, property));
   }
   throw new TypeError("JSON edit path is empty");
 };
+
+/** Edit authority beyond the members a client reads. */
+export interface ClientConfigurationEditOptions {
+  /**
+   * Remove every repeated member at a deleted path instead of refusing. Set
+   * only after deciding that each `shadowedClientServers` member there is the
+   * caller's to remove, so no earlier duplicate becomes active.
+   */
+  readonly removeShadowedMembers?: boolean;
+}
 
 /**
  * Serialize a validated client document, retaining JSONC and TOML comments.
@@ -1457,6 +1632,7 @@ export const serializeClientConfiguration = (
   format: ClientConfigurationFormat | undefined,
   originalText?: string,
   editedPaths?: readonly (readonly string[])[],
+  options: ClientConfigurationEditOptions = {},
 ): Result<string, ClientConfigurationShadowedMember> => {
   if (format === undefined || format === "unsupported")
     throw new TypeError("client does not have a supported MCP config format");
@@ -1477,7 +1653,12 @@ export const serializeClientConfiguration = (
     return ok(`${JSON.stringify(document, null, 2)}\n`);
   let text = originalText;
   for (const path of editedPaths) {
-    const edited = editJsonMember(text, path, valueAt(document, path));
+    const edited = editJsonMember(
+      text,
+      path,
+      valueAt(document, path),
+      options.removeShadowedMembers === true,
+    );
     if (!edited.ok) return edited;
     text = edited.value;
   }
