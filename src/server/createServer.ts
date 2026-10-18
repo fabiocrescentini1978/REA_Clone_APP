@@ -82,6 +82,10 @@ import { registerJavaScriptRecoveryTool } from "./registerJavaScriptRecoveryTool
 import { JavaScriptRecoveryService } from "../application/javascript/JavaScriptRecoveryService.js";
 import type { JavaScriptRecoveryPort } from "../application/javascript/JavaScriptRecoveryPort.js";
 import { createJavaScriptRecoveryProvider } from "../composition/javascriptRecovery.js";
+import { registerJavaScriptDeobfuscationTool } from "./registerJavaScriptDeobfuscationTool.js";
+import { JavaScriptDeobfuscationService } from "../application/javascript/JavaScriptDeobfuscationService.js";
+import type { JavaScriptDeobfuscationPort } from "../application/javascript/JavaScriptDeobfuscationPort.js";
+import { createJavaScriptDeobfuscationProvider } from "../composition/javascriptDeobfuscation.js";
 import { registerElectronTools } from "./registerElectronTools.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { registerEnhancedTools } from "./registerEnhancedTools.js";
@@ -163,6 +167,7 @@ export interface CreateServerOptions {
   readonly recordedCrash?: RecordedCrashService;
   readonly firmwareAnalysis?: FirmwareAnalysisPort;
   readonly javascriptRecovery?: JavaScriptRecoveryPort;
+  readonly javascriptDeobfuscation?: JavaScriptDeobfuscationPort;
   readonly webModuleTrace?: WebModuleTraceService;
   readonly webSourceLocation?: WebSourceLocationService;
   readonly webRuntime?: WebRuntimeService;
@@ -224,6 +229,9 @@ const installSessionToolAvailability = (
       javascriptRecoveryEnabled:
         options.javascriptRecovery !== undefined ||
         (linuxX64 && isAbsolute(environment.REA_WAKARU_COMMAND ?? "")),
+      javascriptDeobfuscationEnabled:
+        options.javascriptDeobfuscation !== undefined ||
+        (linuxX64 && isAbsolute(environment.REA_JS_REDOX_COMMAND ?? "")),
       browserScenarioEnabled: options.browserScenarioCapture !== undefined,
       electronObservationEnabled: options.electronObservation !== undefined,
       electronAutomationEnabled:
@@ -317,6 +325,9 @@ export const createServer = (
     options.webNetworkCapture ?? createWebNetworkCaptureService(environment);
   const javascriptRecovery =
     options.javascriptRecovery ?? createJavaScriptRecoveryProvider(environment);
+  const javascriptDeobfuscation =
+    options.javascriptDeobfuscation ??
+    createJavaScriptDeobfuscationProvider(environment);
   const artifactResources = new ArtifactResourceScope();
   const reverseEngineering =
     createReverseEngineeringService(providerEnvironment);
@@ -334,6 +345,7 @@ export const createServer = (
     webSourceLocation,
     webModuleTrace,
     javascriptRecovery,
+    javascriptDeobfuscation,
   };
   const startedAt = new Date().toISOString();
   const logger = options.logger ?? silentLogger;
@@ -407,6 +419,7 @@ export const createServer = (
             options.electronActiveObservation?.close?.() ?? Promise.resolve(),
           ]),
       webRuntime.provider.close?.() ?? Promise.resolve(),
+      javascriptDeobfuscation.close?.() ?? Promise.resolve(),
       artifactResources.close(),
       reverseEngineering.close(),
       firmwareAnalysis.close(),
@@ -790,6 +803,18 @@ const registerConfiguredAnalysisTools = (
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,
+  );
+  registerJavaScriptDeobfuscationTool(
+    server,
+    new JavaScriptDeobfuscationService(
+      options.javascriptDeobfuscation ??
+        createJavaScriptDeobfuscationProvider(environment),
+    ),
+    {
+      logger: toolLogger,
+      ...(recordEvidence === undefined ? {} : { recordEvidence }),
+      ...(withAdmittedAnalysis === undefined ? {} : { withAdmittedAnalysis }),
+    },
   );
 };
 
