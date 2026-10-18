@@ -77,6 +77,23 @@ and tool profile. Text offsets count UTF-16 code units; follow `next_offset`.
 The complete source remains retained after an oversized MCP reply. No target
 execution or network acquisition is implied, and WAT is decoded representation.
 
+## Offline APK signatures
+
+Use `inspect_apk_signature` for a selected local APK/ZIP/AAB. It reads the APK
+Signing Block (v2/v3/v3.1) and v1 `META-INF` signing without executing anything,
+and reports each signer's certificate facts (for v1, the certificate the PKCS#7
+block's SignerInfo names), the declared v3 rotation lineage,
+the declared source-stamp certificate and, for SHA-256/SHA-512 digests, whether
+the declared content digest matches the current bytes. That match is not a
+signature verification: anyone who changes the bytes can recompute the digest.
+`posture` summarises v1-only signing (which cannot tell a v1-only APK from one
+whose v2/v3 block was removed), observed signer agreement across schemes,
+whether the v1 signer equals the block-scheme signer (`false` is notable),
+whether every differing signer appears in a declared (unverified) rotation
+lineage, and the strongest scheme.
+It never claims authenticity: no signature or lineage is cryptographically
+verified.
+
 ## Native targets
 
 After `open_binary`, use focused search, procedure, or function tools directly.
