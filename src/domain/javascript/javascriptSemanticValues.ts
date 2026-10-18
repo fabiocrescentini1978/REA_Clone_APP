@@ -37,10 +37,13 @@ import {
   type JavaScriptSemanticBindingState,
 } from "./javascriptSemanticState.js";
 import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
+import { semanticRequireShimOrigin } from "./javascriptRequireShimOrigin.js";
+import { ELECTRON_MODULE } from "./javascriptElectronMemberWrites.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import {
   readExactJavaScriptLiteral,
   semanticStaticPropertyKey,
+  semanticObjectPrototypeProperty,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
@@ -744,12 +747,7 @@ const evaluateObject = (
       continue;
     }
     // This spelling changes the prototype instead of defining an own slot.
-    if (
-      t.isObjectProperty(property) &&
-      !property.computed &&
-      !property.shorthand &&
-      name === "__proto__"
-    ) {
+    if (property === semanticObjectPrototypeProperty(node)) {
       unknownProperties = true;
       if (omittedProperties !== null) omittedProperties += 1;
       continue;
@@ -1101,6 +1099,11 @@ const provenanceForExpression = (
   const required = semanticRequireOrigin(node, context.state);
   if (required !== undefined)
     return semanticOriginsProvenance([required.origin]);
+  // Electron owns alias-aware export invalidation for these saved loaders.
+  // Other module families still require their direct-loader mutation proof.
+  const shim = semanticRequireShimOrigin(node, context.state);
+  if (shim !== undefined && ELECTRON_MODULE.test(shim.origin.specifier))
+    return semanticOriginsProvenance([shim.origin]);
   if (t.isSequenceExpression(node)) {
     const finalExpression = node.expressions.at(-1);
     return finalExpression === undefined

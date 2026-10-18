@@ -1,12 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
+import {
+  analyzeJavaScriptStaticSource,
+  analyzeParsedJavaScriptStaticSource,
+} from "./javascriptStaticAnalysis.js";
+import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { ROLLDOWN_MODULE_INTEROP } from "./javascriptModuleInterop.fixture.js";
 
 const WINDOW =
   'new electron.BrowserWindow({webPreferences:{preload:"./preload.js"}});';
 const IMPORT = 'let electron = require("electron");';
 const WRAP = "electron = __toESM(electron, 1);";
+const REQUIRE_SHIM =
+  'var Q = (fallback => typeof require < "u" ? require : fallback)(function() {});';
+const SHIM_NAMESPACE_INPUTS = [
+  'const electron = __toESM(Q("electron"), 1);',
+  'let electron = Q("electron"); electron = __toESM(electron, 1);',
+];
 // The upstream runtime uses control-body braces that its bundled printer omits.
 // https://github.com/rolldown/rolldown/blob/22a0ab13732d81f2559ad2b7064b688699324889/crates/rolldown/src/runtime/runtime-base.js
 const BLOCK_MODULE_INTEROP = ROLLDOWN_MODULE_INTEROP.replace(
@@ -70,6 +80,126 @@ describe("Electron module interop identity", () => {
       analyzeJavaScriptStaticSource(`${altered}\n${IMPORT} ${WRAP} ${WINDOW}`)
         .electron.browser_windows,
     ).toEqual([]);
+  });
+});
+
+describe("Electron module interop namespace copies", () => {
+  const copies = [
+    ["spread", "const copy={...namespace};"],
+    ["rest", "const {...copy}=namespace;"],
+  ] as const;
+  const load =
+    'new (require.call.call(require,null,"electron").BrowserWindow)({});';
+
+  it.each(copies)(
+    "excludes inherited helpers from a namespace %s copy",
+    (_kind, copy) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP}
+        const source={__proto__:Function.prototype};
+        const namespace=__toESM(source,1);
+        ${copy}
+        const value=copy.call??{};
+        value.call=other;
+        ${load}
+      `);
+      expect(analysis.parse_error_count).toBe(0);
+      expect(analysis.electron.browser_windows).toHaveLength(1);
+    },
+  );
+
+  it.each(copies)(
+    "retains own shared helpers in a namespace %s copy",
+    (_kind, copy) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP}
+        const source={call:Function.prototype.call};
+        const namespace=__toESM(source,1);
+        ${copy}
+        copy.call.call=other;
+        ${load}
+      `);
+      expect(analysis.parse_error_count).toBe(0);
+      expect(analysis.electron.browser_windows).toEqual([]);
+    },
+  );
+});
+
+describe("Electron module interop shim inputs", () => {
+  it.each([
+    ...SHIM_NAMESPACE_INPUTS.map((input) => `${input} ${WINDOW}`),
+    'new (__toESM(Q("electron"), 1).BrowserWindow)({webPreferences:{preload:"./preload.js"}});',
+    'const {default: {BrowserWindow}} = __toESM(Q("electron"), 1); new BrowserWindow({webPreferences:{preload:"./preload.js"}});',
+    'const Window = __toESM(Q("electron"), 1).BrowserWindow; new Window({webPreferences:{preload:"./preload.js"}});',
+  ])("preserves a proven shim module through conversion: %s", (consumer) => {
+    const analysis = analyzeJavaScriptStaticSource(
+      `${ROLLDOWN_MODULE_INTEROP}\n${REQUIRE_SHIM}\n${consumer}`,
+    );
+    expect(analysis.parse_error_count).toBe(0);
+    expect(analysis.electron.browser_windows).toMatchObject([
+      { preload_path: "./preload.js" },
+    ]);
+  });
+
+  it.each(SHIM_NAMESPACE_INPUTS)(
+    "preserves captured loaders and intrinsics through later supplier writes: %s",
+    (input) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP} ${REQUIRE_SHIM}
+        require = other; Object.create = customCreate;
+        ${input} ${WINDOW}
+      `);
+      expect(analysis.electron.browser_windows).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["saved loader binding", "Q = other;"],
+    ["host module delegate", "module.require = other;"],
+    ["namespace helper", "__toESM = () => ({});"],
+    ["copy helper", "__copyProps = () => ({});"],
+    ["captured intrinsic binding", "__defProp = other;"],
+    ["live intrinsic member", "__hasOwnProp.call = other;"],
+  ])("keeps a replaced %s unresolved", (_name, write) => {
+    for (const input of SHIM_NAMESPACE_INPUTS) {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP} ${REQUIRE_SHIM}
+        ${write} ${input} ${WINDOW}
+      `);
+      expect(analysis.electron.browser_windows).toEqual([]);
+    }
+  });
+
+  it.each(SHIM_NAMESPACE_INPUTS)(
+    "requires the original host loader at shim capture: %s",
+    (input) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP} require = other;
+        ${REQUIRE_SHIM} ${input} ${WINDOW}
+      `);
+      expect(analysis.electron.browser_windows).toEqual([]);
+    },
+  );
+
+  it.each(SHIM_NAMESPACE_INPUTS)(
+    "invalidates live exports after a shared module mutation: %s",
+    (input) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+        ${ROLLDOWN_MODULE_INTEROP} ${REQUIRE_SHIM} ${input}
+        Q("electron").BrowserWindow = Fake; ${WINDOW}
+      `);
+      expect(analysis.electron.browser_windows).toEqual([]);
+    },
+  );
+
+  it("preserves a constructor captured before a shared export mutation", () => {
+    const analysis = analyzeJavaScriptStaticSource(`
+      ${ROLLDOWN_MODULE_INTEROP} ${REQUIRE_SHIM}
+      const Window = __toESM(Q("electron"), 1).BrowserWindow;
+      Q("electron").BrowserWindow = Fake;
+      new Window({});
+    `);
+    expect(analysis.electron.browser_windows).toHaveLength(1);
   });
 });
 
@@ -365,6 +495,29 @@ describe("Electron module interop pattern writes", () => {
 
 describe("Electron module interop intrinsic captures", () => {
   it.each([
+    "__hasOwnProp.__proto__={call(){return true}};",
+    "Object.prototype.hasOwnProperty.__proto__={call(){return true}};",
+  ])("rejects a replaced supplier of a live helper read: %s", (write) => {
+    const analysis = analyzeJavaScriptStaticSource(`
+      ${ROLLDOWN_MODULE_INTEROP} ${write} ${IMPORT} ${WRAP} ${WINDOW}
+    `);
+    expect(analysis.electron.browser_windows).toEqual([]);
+  });
+
+  it.each([
+    "Object.prototype.hasOwnProperty=custom;",
+    "Function.prototype.__proto__={call(){return true}};",
+  ])(
+    "preserves captured operations with an intact helper supplier: %s",
+    (write) => {
+      const analysis = analyzeJavaScriptStaticSource(`
+      ${ROLLDOWN_MODULE_INTEROP} ${write} ${IMPORT} ${WRAP} ${WINDOW}
+    `);
+      expect(analysis.electron.browser_windows).toHaveLength(1);
+    },
+  );
+
+  it.each([
     "var captured = Object.defineProperty;",
     "const {defineProperty:captured} = Object;",
     "var first = Object.defineProperty; const captured = first;",
@@ -515,13 +668,18 @@ describe("Electron module interop capture and scope", () => {
   });
 
   it("preserves captured intrinsics across later vendor polyfills and callable writes", () => {
-    const analysis = analyzeJavaScriptStaticSource(`${ROLLDOWN_MODULE_INTEROP}
+    const source = `${ROLLDOWN_MODULE_INTEROP}
       Object.create = customCreate;
       ${IMPORT} ${WRAP}
       function runLoop(key) { globalThis[key] = this; }
       function polyfill() { Object.create = customCreate; }
       ${WINDOW}
-    `);
+    `;
+    // The runtime fixture comes from main.cjs: these helper vars are local to
+    // the wrapper, while the deferred wildcard write addresses global slots.
+    const parsed = parseJavaScriptSource(source, "vendor-main.cjs");
+    expect(parsed).not.toBeNull();
+    const analysis = analyzeParsedJavaScriptStaticSource(source, parsed!);
     expect(analysis.electron.browser_windows).toHaveLength(1);
   });
 

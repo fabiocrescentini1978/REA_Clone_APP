@@ -74,18 +74,24 @@ it.each([false, true])(
           accessibility: true,
         },
       });
+      expect(cleanupLease.released).toBe(!fails);
       expect(parseMcpToolError(result)).toMatchObject({
         error: {
-          code: fails ? "cleanup_incomplete" : "cancelled",
+          code: fails ? "cleanup_incomplete" : "provider_timeout",
           details: {
-            cleanup: fails ? "incomplete" : "complete",
             ...(fails
               ? {
+                  cleanup: "incomplete",
                   execution_failure: "execution_failure",
-                  diagnostics: { primary_error: { code: "cancelled" } },
+                  diagnostics: {
+                    primary_error: {
+                      code: "provider_timeout",
+                      details: { timeout_ms: 180_000 },
+                    },
+                  },
                   resources: ["controlled-ui-runtime"],
                 }
-              : {}),
+              : { timeout_ms: 180_000 }),
             partial_observation: {
               initial: snapshot,
               steps: [],

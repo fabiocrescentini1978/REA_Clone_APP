@@ -28,6 +28,8 @@ import type {
 export interface JavaScriptSemanticInitializer {
   readonly node: t.Node;
   readonly projection: readonly (string | number | null)[];
+  /** The default whose input slot is selected after earlier pattern effects. */
+  readonly selection?: t.AssignmentPattern;
   readonly entryBody?: t.BlockStatement;
 }
 
@@ -45,6 +47,8 @@ interface JavaScriptSemanticReferenceInitializer extends JavaScriptSemanticIniti
 export interface JavaScriptSemanticMemberEffect {
   readonly path: JavaScriptSemanticPropertyPath;
   readonly node: t.Node | undefined;
+  /** A normalized value store, rather than a descriptor/prototype mutation. */
+  readonly valueOnly?: true;
 }
 
 export type JavaScriptSemanticEffectTiming = "before" | "after" | "unknown";
@@ -130,7 +134,9 @@ export interface JavaScriptSemanticAnalysisState {
   readonly callableNodesById: Map<string, t.Node>;
   readonly moduleLinks: JavaScriptSemanticModuleLink[];
   /** Exact calls already represented by binding or dependency links. */
-  readonly linkedRequireCalls: WeakSet<t.CallExpression>;
+  readonly linkedRequireCalls: WeakSet<
+    t.CallExpression | t.OptionalCallExpression
+  >;
   readonly moduleLinkBindings: WeakMap<
     JavaScriptSemanticModuleLink,
     JavaScriptSemanticBindingState
@@ -538,7 +544,8 @@ export const isUnmodifiedCommonJsWrapperBinding = (
   return binding !== undefined && binding.initializers.length === 0;
 };
 
-/** Program `var` redeclarations retain wrapper identity until a source write. */
+/** Program `var` redeclarations retain wrapper identity until a source write.
+ * Resolve the name at any lexical site, including an opaque direct-eval call. */
 export const commonJsWrapperBindingDeclaration = (
   node: t.Node,
   name: string,
@@ -548,8 +555,7 @@ export const commonJsWrapperBindingDeclaration = (
   // specifier resolution mode does not establish that distinction.
   if (
     state.program.sourceType !== "script" ||
-    !["module", "exports", "require"].includes(name) ||
-    !t.isIdentifier(node, { name })
+    !["module", "exports", "require"].includes(name)
   )
     return undefined;
   const binding = resolveSemanticBindingState(state, node, name);

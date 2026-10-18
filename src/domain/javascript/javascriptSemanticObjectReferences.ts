@@ -2,9 +2,13 @@ import * as t from "@babel/types";
 import {
   resolveSemanticBindingState,
   type JavaScriptSemanticAnalysisState,
+  type JavaScriptSemanticBindingState,
 } from "./javascriptSemanticState.js";
 import {
   semanticStaticPropertyKey,
+  semanticObjectPrototypeProperty,
+  staticObjectOwnProperty,
+  readExactJavaScriptLiteral,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
 import {
@@ -17,6 +21,555 @@ import {
   type GetterQueryJob,
 } from "./javascriptSemanticGetterQueries.js";
 import { expandSemanticGetterResult } from "./javascriptSemanticGetterResults.js";
+import { semanticBindingAtRead } from "./javascriptSemanticMutationInitializers.js";
+import { semanticCopiedReferencePath } from "./javascriptSemanticReferenceSources.js";
+import { semanticOpaqueBindingReadMayHaveChanged } from "./javascriptSemanticOpaqueEffects.js";
+
+export type SemanticCapturedOwnSlot =
+  | { readonly status: "unknown" }
+  | {
+      readonly status: "updated";
+      readonly sources: readonly {
+        readonly node: t.Node;
+        readonly projection: PropertyPath;
+        readonly writable?: boolean;
+        readonly data?: true;
+      }[];
+    };
+
+export interface SemanticOwnReferenceFacts {
+  readonly selectedOwnSlot?: (
+    owner: t.Node,
+    key: string,
+    read: t.Node,
+  ) => SemanticCapturedOwnSlot | undefined;
+  readonly physicalPrototype?: (
+    owner: t.Node,
+    read: t.Node,
+  ) =>
+    | { readonly status: "unchanged" | "unknown" }
+    | { readonly status: "updated"; readonly nodes: readonly t.Node[] };
+  readonly ownSlotUnchanged: (
+    owner: t.Node,
+    key: string,
+    read: t.Node,
+  ) => boolean;
+  readonly ownDescriptorIntact?: (
+    owner: t.Node,
+    key: string,
+    read: t.Node,
+  ) => boolean;
+  readonly bindingReadMayHaveChanged?: (
+    binding: JavaScriptSemanticBindingState,
+    read: t.Node,
+  ) => boolean;
+  readonly returnedReferences?: (
+    callee: t.Node,
+  ) => readonly { readonly node: t.Node; readonly projection: PropertyPath }[];
+  readonly ownClassSlotIntact?: (
+    owner: t.Class,
+    key: string,
+    read: t.Node,
+  ) => boolean;
+}
+
+/** Bounded source references whose own descriptors are intact at each capture.
+ * This query consumes syntax and completed effects, never provisional constant
+ * values. Copy slots keep their source capture while children retain the later
+ * read, so deleting a source slot cannot erase an already copied reference. */
+export const semanticOwnReferenceCandidates = (
+  source: t.Node,
+  projection: readonly (string | null)[],
+  state: JavaScriptSemanticAnalysisState,
+  facts: SemanticOwnReferenceFacts,
+  read = source,
+  presenceOnly = false,
+  readCaptures?: readonly t.Node[],
+): {
+  readonly complete: boolean;
+  readonly nodes: readonly t.Node[];
+  readonly absent: boolean;
+} => {
+  const pending = [
+    {
+      node: source,
+      path: projection,
+      captures: projection.map((_, index) => readCaptures?.[index] ?? read),
+    },
+  ];
+  const nodes: t.Node[] = [];
+  const seen = new Map<t.Node, Set<string>>();
+  const captureIds = new WeakMap<t.Node, number>();
+  let nextCaptureId = 0;
+  let complete = true;
+  let unknown = false;
+  let missing = false;
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    let node = unwrapJavaScriptExpression(current.node).node;
+    let path = current.path;
+    let captures = current.captures;
+    const members: (string | null)[] = [];
+    while (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
+      members.unshift(semanticStaticPropertyKey(node.property, node.computed));
+      node = unwrapJavaScriptExpression(node.object).node;
+    }
+    path = [...members, ...path];
+    captures = [...members.map(() => current.node), ...captures];
+    const signature = JSON.stringify([
+      path,
+      captures.map((capture) => {
+        let id = captureIds.get(capture);
+        if (id === undefined) {
+          id = nextCaptureId++;
+          captureIds.set(capture, id);
+        }
+        return id;
+      }),
+    ]);
+    const prior = seen.get(node);
+    if (prior?.has(signature)) continue;
+    if (prior !== undefined) {
+      {
+        unknown = true;
+        complete = false;
+      }
+      continue;
+    }
+    seen.set(node, new Set([signature]));
+    const push = (value: t.Node, selected = path, at = captures) =>
+      pending.push({ node: value, path: selected, captures: at });
+    if (t.isIdentifier(node)) {
+      const binding = resolveSemanticBindingState(state, node, node.name);
+      if (binding === undefined) {
+        if (path.length === 0) nodes.push(node);
+        else {
+          unknown = true;
+          complete = false;
+        }
+        continue;
+      }
+      if (
+        facts.bindingReadMayHaveChanged?.(binding, node) ??
+        semanticOpaqueBindingReadMayHaveChanged(binding, node, state)
+      ) {
+        {
+          unknown = true;
+          complete = false;
+        }
+        continue;
+      }
+      const selected = semanticBindingAtRead(
+        binding,
+        node,
+        state.parentsByNode,
+      ).binding;
+      let alternatives = 0;
+      for (const initializer of selected.initializers) {
+        if (
+          initializer.projection.some(
+            (key) => key === null || typeof key === "object",
+          )
+        ) {
+          {
+            unknown = true;
+            complete = false;
+          }
+          continue;
+        }
+        alternatives += 1;
+        push(
+          initializer.node,
+          [...initializer.projection.map(String), ...path],
+          [...initializer.projection.map(() => initializer.node), ...captures],
+        );
+      }
+      for (const initializer of selected.referenceInitializers) {
+        const copied = semanticCopiedReferencePath(
+          initializer,
+          path,
+          "reference",
+        );
+        if (copied === null) {
+          {
+            unknown = true;
+            complete = false;
+          }
+          continue;
+        }
+        alternatives += 1;
+        const at = [
+          ...initializer.projection.map(() => initializer.node),
+          ...captures,
+        ];
+        const offset = initializer.copyProjectionOffset;
+        if (offset !== undefined) {
+          at.splice(offset, 1);
+          at[offset] = initializer.node;
+        }
+        push(
+          initializer.node,
+          copied.map((key) =>
+            key === null || typeof key === "object" ? null : String(key),
+          ),
+          at,
+        );
+      }
+      if (alternatives === 0) {
+        unknown = true;
+        complete = false;
+      }
+      continue;
+    }
+    if (t.isConditionalExpression(node) || t.isLogicalExpression(node)) {
+      push(t.isConditionalExpression(node) ? node.consequent : node.left);
+      push(t.isConditionalExpression(node) ? node.alternate : node.right);
+      continue;
+    }
+    if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
+      const returned = facts.returnedReferences?.(node.callee) ?? [];
+      if (returned.length === 0) {
+        unknown = true;
+        complete = false;
+      }
+      for (const reference of returned) {
+        if (
+          reference.projection.some(
+            (key) => key === null || typeof key === "object",
+          )
+        ) {
+          {
+            unknown = true;
+            complete = false;
+          }
+          continue;
+        }
+        push(
+          reference.node,
+          [...reference.projection.map(String), ...path],
+          [...reference.projection.map(() => reference.node), ...captures],
+        );
+      }
+      continue;
+    }
+    if (path.length === 0) {
+      nodes.push(node);
+      continue;
+    }
+    const key = path[0];
+    const at = captures[0];
+    const updated =
+      typeof key === "string" && at !== undefined
+        ? facts.selectedOwnSlot?.(node, key, at)
+        : undefined;
+    if (updated !== undefined) {
+      if (updated.status === "unknown") {
+        unknown = true;
+        complete = false;
+        continue;
+      }
+      for (const source of updated.sources) {
+        if (
+          source.projection.some(
+            (member) => member === null || typeof member === "object",
+          )
+        ) {
+          {
+            unknown = true;
+            complete = false;
+          }
+          continue;
+        }
+        push(
+          source.node,
+          [...source.projection.map(String), ...path.slice(1)],
+          [...source.projection.map(() => source.node), ...captures.slice(1)],
+        );
+      }
+      continue;
+    }
+    if (
+      t.isClass(node) &&
+      presenceOnly &&
+      path.length === 1 &&
+      typeof key === "string" &&
+      at !== undefined &&
+      facts.ownClassSlotIntact?.(node, key, at) === true
+    ) {
+      nodes.push(node);
+      continue;
+    }
+    if (
+      typeof key !== "string" ||
+      at === undefined ||
+      !(
+        presenceOnly && path.length === 1
+          ? (facts.ownDescriptorIntact ?? facts.ownSlotUnchanged)
+          : facts.ownSlotUnchanged
+      )(node, key, at)
+    ) {
+      {
+        unknown = true;
+        complete = false;
+      }
+      continue;
+    }
+    if (t.isArrayExpression(node)) {
+      const index = Number(key);
+      const element =
+        Number.isInteger(index) && String(index) === key
+          ? node.elements[index]
+          : undefined;
+      if (node.elements.some(t.isSpreadElement) || !t.isExpression(element)) {
+        unknown = true;
+        complete = false;
+      } else push(element, path.slice(1), captures.slice(1));
+      continue;
+    }
+    if (!t.isObjectExpression(node)) {
+      {
+        unknown = true;
+        complete = false;
+      }
+      continue;
+    }
+    const own = staticObjectOwnProperty(node, key);
+    if (own.status === "explicit") {
+      push(
+        t.isObjectProperty(own.property) ? own.property.value : own.property,
+        path.slice(1),
+        captures.slice(1),
+      );
+      continue;
+    }
+    // An alias spread has no direct declaration descriptor. Its own source
+    // slot is selected at spread creation, independently of the later copy.
+    const spreads = node.properties.filter(t.isSpreadElement);
+    if (
+      own.status === "dynamic" &&
+      spreads.length === 1 &&
+      node.properties.every(
+        (property) =>
+          t.isSpreadElement(property) ||
+          property === semanticObjectPrototypeProperty(node) ||
+          semanticStaticPropertyKey(property.key, property.computed) !== null,
+      )
+    ) {
+      const spread = spreads[0]!;
+      const sourceRead = [...captures];
+      sourceRead[0] = spread;
+      push(spread.argument, path, sourceRead);
+    } else if (own.status === "missing") {
+      missing = true;
+      complete = false;
+    } else {
+      unknown = true;
+      complete = false;
+    }
+  }
+  return {
+    complete: complete && nodes.length > 0,
+    nodes,
+    absent: missing && !unknown && nodes.length === 0,
+  };
+};
+
+export type SemanticSourcePropertySlot =
+  | {
+      readonly kind:
+        | "missing"
+        | "ordinary-prototype"
+        | "callable-prototype"
+        | "unknown";
+    }
+  | { readonly kind: "external"; readonly node: t.Node }
+  | {
+      readonly kind: "updated";
+      readonly writable: boolean;
+      readonly mayInvokeSetter?: boolean;
+    }
+  | {
+      readonly kind: "source";
+      readonly property: t.ObjectMethod | t.ObjectProperty;
+      readonly unchanged: boolean;
+      readonly mayInvokeSetter: boolean;
+    };
+
+/** Descriptor lookup shares captured source/prototype facts with value lookup.
+ * A terminal remains explicit so callers can distinguish descriptor presence,
+ * writable inherited data, and the native accessor's receiver semantics. */
+export const semanticEverySourcePropertySlot = (
+  receiver: t.Node,
+  key: string,
+  read: t.Node | undefined,
+  state: JavaScriptSemanticAnalysisState,
+  facts: SemanticOwnReferenceFacts,
+  accept: (slot: SemanticSourcePropertySlot) => boolean,
+  references?: (
+    source: t.Node,
+  ) => ReturnType<typeof semanticOwnReferenceCandidates>,
+): boolean => {
+  const pending: t.Node[] = [receiver];
+  const seen = new Set<t.Node>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) break;
+    const candidates =
+      references?.(current) ??
+      semanticOwnReferenceCandidates(current, [], state, facts);
+    if (!candidates.complete || candidates.nodes.length !== 1) {
+      if (!accept({ kind: "external", node: current })) return false;
+      continue;
+    }
+    const node = candidates.nodes[0]!;
+    if (seen.has(node)) return false;
+    seen.add(node);
+    if (t.isNullLiteral(node)) {
+      if (!accept({ kind: "missing" })) return false;
+      continue;
+    }
+    if (
+      t.isClass(node) &&
+      read !== undefined &&
+      facts.ownClassSlotIntact?.(node, key, read) === true
+    ) {
+      if (!accept({ kind: "updated", writable: false })) return false;
+      continue;
+    }
+    if (t.isConditionalExpression(node) || t.isLogicalExpression(node)) {
+      pending.push(
+        t.isConditionalExpression(node) ? node.consequent : node.left,
+        t.isConditionalExpression(node) ? node.alternate : node.right,
+      );
+      continue;
+    }
+    if (t.isClass(node)) {
+      const physical =
+        read === undefined ? undefined : facts.physicalPrototype?.(node, read);
+      if (physical?.status === "unknown") {
+        if (!accept({ kind: "unknown" })) return false;
+      } else if (physical?.status === "updated")
+        pending.push(...physical.nodes);
+      else if (node.superClass == null || t.isNullLiteral(node.superClass)) {
+        if (!accept({ kind: "callable-prototype" })) return false;
+      } else pending.push(node.superClass);
+      continue;
+    }
+    if (t.isObjectExpression(node)) {
+      const updated =
+        read === undefined
+          ? undefined
+          : facts.selectedOwnSlot?.(node, key, read);
+      if (updated !== undefined) {
+        if (updated.status === "unknown") {
+          if (!accept({ kind: "unknown" })) return false;
+          continue;
+        }
+        if (
+          !accept({
+            kind: "updated",
+            writable:
+              updated.sources.length > 0 &&
+              updated.sources.every((source) => source.writable === true),
+            mayInvokeSetter: updated.sources.some(
+              (source) => source.data !== true && source.writable !== true,
+            ),
+          })
+        )
+          return false;
+        continue;
+      }
+      const own = staticObjectOwnProperty(node, key);
+      if (
+        own.status === "explicit" &&
+        read !== undefined &&
+        (facts.ownDescriptorIntact ?? facts.ownSlotUnchanged)(node, key, read)
+      ) {
+        const capturedAt = read;
+        if (
+          !accept({
+            kind: "source",
+            property: own.property,
+            mayInvokeSetter:
+              t.isObjectMethod(own.property) &&
+              own.property.kind !== "method" &&
+              (own.property.kind === "set" || own.setter !== "absent"),
+            get unchanged() {
+              return facts.ownSlotUnchanged(node, key, capturedAt);
+            },
+          })
+        )
+          return false;
+        continue;
+      }
+      if (own.status === "dynamic") {
+        if (!accept({ kind: "unknown" })) return false;
+        continue;
+      }
+      if (
+        own.status === "missing" &&
+        read !== undefined &&
+        (facts.ownDescriptorIntact ?? facts.ownSlotUnchanged)(
+          node,
+          key,
+          read,
+        ) !== true
+      ) {
+        if (!accept({ kind: "unknown" })) return false;
+        continue;
+      }
+      const physical =
+        read === undefined ? undefined : facts.physicalPrototype?.(node, read);
+      if (physical?.status === "unknown") {
+        if (!accept({ kind: "unknown" })) return false;
+        continue;
+      }
+      if (physical?.status === "updated") {
+        pending.push(...physical.nodes);
+        continue;
+      }
+      const prototype = semanticObjectPrototypeProperty(node);
+      if (prototype === undefined) {
+        if (!accept({ kind: "ordinary-prototype" })) return false;
+        continue;
+      }
+      const literal = readExactJavaScriptLiteral(prototype.value);
+      // A primitive setter argument leaves the ordinary prototype in place.
+      if (literal.found && literal.value !== null) {
+        if (!accept({ kind: "ordinary-prototype" })) return false;
+        continue;
+      }
+      pending.push(prototype.value);
+      continue;
+    }
+    if (!accept({ kind: "external", node })) return false;
+  }
+  return true;
+};
+
+/** A native inherited getter returns the original receiver's prototype. */
+export const semanticNativePrototypeGetterPossible = (
+  receiver: t.Node,
+  read: t.Node | undefined,
+  state: JavaScriptSemanticAnalysisState,
+  facts: SemanticOwnReferenceFacts,
+  references?: (
+    source: t.Node,
+  ) => ReturnType<typeof semanticOwnReferenceCandidates>,
+): boolean =>
+  !semanticEverySourcePropertySlot(
+    receiver,
+    "__proto__",
+    read,
+    state,
+    facts,
+    (slot) =>
+      slot.kind === "source" ||
+      slot.kind === "updated" ||
+      slot.kind === "missing",
+    references,
+  );
 
 export interface JavaScriptSemanticObjectReference {
   readonly node: t.Node;
@@ -143,7 +696,7 @@ interface ClassPropertyLookup {
   readonly initializedBefore?: t.ClassProperty;
 }
 
-const classPropertyDescriptors = (
+export const semanticClassPropertyDescriptors = (
   klass: t.ClassDeclaration | t.ClassExpression,
   propertyName: string | null,
   kind: ClassPropertyLookup["kind"],
@@ -226,6 +779,11 @@ const classPropertyDescriptors = (
     getters: selectedGetters,
     fields,
     inherits: matchingMembers.length === 0,
+    mayInvokeSetter: indexedMembers.some(
+      ({ member, key }) =>
+        t.isClassMethod(member, { kind: "set" }) &&
+        (propertyName === null || key === null || key === propertyName),
+    ),
   };
 };
 
@@ -297,7 +855,7 @@ class ClassReferenceWalk {
   }
 
   #visit(klass: t.ClassDeclaration | t.ClassExpression): void {
-    const descriptors = classPropertyDescriptors(
+    const descriptors = semanticClassPropertyDescriptors(
       klass,
       this.#name,
       this.lookup.kind,
@@ -539,13 +1097,7 @@ const objectPropertyIndex = (node: t.ObjectExpression): ObjectPropertyIndex => {
     const name = t.isSpreadElement(property)
       ? null
       : semanticStaticPropertyKey(property.key, property.computed);
-    if (
-      name === null ||
-      (t.isObjectProperty(property) &&
-        !property.computed &&
-        !property.shorthand &&
-        name === "__proto__")
-    ) {
+    if (name === null || property === semanticObjectPrototypeProperty(node)) {
       keyIndependent.push(index);
       return;
     }
@@ -650,15 +1202,10 @@ class ObjectReferenceWalk {
     }
   }
 
-  #prototype(
-    property: t.ObjectMethod | t.ObjectProperty,
-    name: string | null,
-  ): boolean {
+  #prototype(property: t.ObjectMethod | t.ObjectProperty): boolean {
     if (
       !t.isObjectProperty(property) ||
-      property.computed ||
-      property.shorthand ||
-      name !== "__proto__"
+      property !== semanticObjectPrototypeProperty(this.node)
     )
       return false;
     const selected = this.#key ?? null;
@@ -715,7 +1262,7 @@ class ObjectReferenceWalk {
       return;
     }
     const name = semanticStaticPropertyKey(property.key, property.computed);
-    if (this.#prototype(property, name)) return;
+    if (this.#prototype(property)) return;
     const kind =
       t.isObjectMethod(property) && property.kind !== "method"
         ? property.kind
@@ -763,15 +1310,7 @@ const objectExpressionDefinesKey = (
         continue;
       }
       const name = semanticStaticPropertyKey(property.key, property.computed);
-      if (
-        name === key &&
-        !(
-          t.isObjectProperty(property) &&
-          !property.computed &&
-          !property.shorthand &&
-          name === "__proto__"
-        )
-      )
+      if (name === key && property !== semanticObjectPrototypeProperty(object))
         return true;
     }
   }

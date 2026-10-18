@@ -36,6 +36,16 @@ export const semanticPropertyPathKeyMatches = (
   return index !== null && index >= key.startIndex;
 };
 
+/** A written owner prefix may affect an exact dependency, including selectors. */
+export const semanticPropertyPathMayAffect = (
+  effect: JavaScriptSemanticPropertyPath,
+  path: readonly string[],
+): boolean =>
+  effect.length <= path.length &&
+  effect.every((key, index) =>
+    semanticPropertyPathKeyMatches(key, path[index]!),
+  );
+
 interface PropertyPathCoverageNode {
   terminal: boolean;
   readonly exact: Map<string, PropertyPathCoverageNode>;

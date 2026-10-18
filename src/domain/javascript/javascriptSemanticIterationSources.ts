@@ -5,16 +5,15 @@ import {
   runtimeFunctionParameters,
   semanticStaticPropertyKey,
 } from "./javascriptAstValues.js";
-import {
-  semanticArrayIndex,
-  type JavaScriptSemanticPropertyPath,
-} from "./javascriptSemanticPropertyPaths.js";
+import { semanticArrayIndex } from "./javascriptSemanticPropertyPaths.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
+import type { JavaScriptSemanticReferenceSource } from "./javascriptSemanticReferenceSources.js";
+import {
+  semanticIntrinsicMutation,
+  type JavaScriptIntrinsicMutationRecipient,
+} from "./javascriptElectronMemberWrites.js";
 
-interface IterationSourceValue {
-  readonly node: t.Node;
-  readonly projection: JavaScriptSemanticPropertyPath;
-}
+type IterationSourceValue = JavaScriptSemanticReferenceSource;
 
 /** An iterator receiver or property reference store, with default guards. */
 export interface SemanticIterationSource extends IterationSourceValue {
@@ -23,7 +22,106 @@ export interface SemanticIterationSource extends IterationSourceValue {
   readonly target?: t.MemberExpression;
   readonly fallbackSources?: readonly IterationSourceValue[];
   readonly requiredSources?: readonly IterationSourceValue[];
+  /** Copy the selected target key from one own source slot, preserving its name. */
+  readonly propertyCopy?: "value" | "descriptor";
+  /** A descriptor getter stores the value returned when its property is read. */
+  readonly invocationResult?: true;
+  /** Definitions bypass setters; assignments and value copies use [[Set]]. */
+  readonly propertyWrite?: "define" | "set";
+  /** Reflect.set starts descriptor lookup here and writes target.object. */
+  readonly propertyLookup?: { readonly target: t.Node | undefined };
 }
+
+/** Parsed data mutators feed the same reference graph as assignment stores. */
+export const semanticIntrinsicDataStores = (
+  recipient: JavaScriptIntrinsicMutationRecipient,
+  mutationSite: t.Node,
+  staticString: (node: t.Node | undefined) => string | undefined,
+): readonly SemanticIterationSource[] => {
+  const target = recipient.target;
+  if (!t.isExpression(target)) return [];
+  const mutation = semanticIntrinsicMutation(recipient.invocation);
+  if (mutation?.kind === "assign" || mutation?.kind === "define-properties") {
+    const args = recipient.invocation.arguments;
+    const values =
+      mutation.kind === "assign" ? args?.slice(1) : args?.slice(1, 2);
+    return (values ?? []).flatMap((source) =>
+      t.isNode(source) && !t.isSpreadElement(source)
+        ? [
+            {
+              kind: "reference-store" as const,
+              node: source,
+              projection: [],
+              mutation: mutationSite,
+              propertyWrite:
+                mutation.kind === "assign"
+                  ? ("set" as const)
+                  : ("define" as const),
+              target: t.memberExpression(
+                target,
+                t.identifier("copiedProperty"),
+                true,
+              ),
+              propertyCopy:
+                mutation.kind === "assign"
+                  ? ("value" as const)
+                  : ("descriptor" as const),
+            },
+            ...(mutation.kind === "define-properties"
+              ? [
+                  {
+                    kind: "reference-store" as const,
+                    node: source,
+                    projection: [],
+                    mutation: mutationSite,
+                    propertyWrite: "define" as const,
+                    target: t.memberExpression(
+                      target,
+                      t.identifier("copiedProperty"),
+                      true,
+                    ),
+                    propertyCopy: "descriptor" as const,
+                    invocationResult: true as const,
+                  },
+                ]
+              : []),
+          ]
+        : [],
+    );
+  }
+  if (mutation?.kind !== "define-property" && mutation?.kind !== "set")
+    return [];
+  if (mutation.accessor === "set") return [];
+  const source = recipient.invocation.arguments?.[mutation.receiver ? 1 : 2];
+  if (!t.isNode(source) || t.isSpreadElement(source)) return [];
+  const key = staticString(mutation.key);
+  const property = key === undefined ? mutation.key : t.stringLiteral(key);
+  if (!t.isExpression(property)) return [];
+  const store = {
+    kind: "reference-store" as const,
+    node: source,
+    mutation: mutationSite,
+    propertyWrite:
+      mutation.kind === "define-property"
+        ? ("define" as const)
+        : ("set" as const),
+    ...(mutation.kind === "set"
+      ? { propertyLookup: { target: recipient.invocation.arguments?.[0] } }
+      : {}),
+    target: t.memberExpression(target, property, true),
+  };
+  if (mutation.accessor === "get")
+    return [{ ...store, projection: [], invocationResult: true }];
+  return [
+    {
+      ...store,
+      projection: mutation.kind === "define-property" ? ["value"] : [],
+    },
+    ...(mutation.kind === "define-property"
+      ? [{ ...store, projection: ["get"], invocationResult: true as const }]
+      : []),
+  ];
+};
 
 interface PatternSource extends IterationSourceValue {
   // A rest binding is a fresh array whose children retain their source indices.
@@ -111,7 +209,7 @@ const visit = (
       ...guards,
       requiredSources: [
         ...(guards.requiredSources ?? []),
-        ...(source === undefined ? [] : [source]),
+        ...(source === undefined ? [] : [{ ...source, selection: pattern }]),
       ],
     });
     visit(
@@ -122,7 +220,7 @@ const visit = (
         ...guards,
         fallbackSources: [
           ...(guards.fallbackSources ?? []),
-          ...(source === undefined ? [] : [source]),
+          ...(source === undefined ? [] : [{ ...source, selection: pattern }]),
         ],
       },
     );
